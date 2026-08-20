@@ -20,21 +20,21 @@ GITHUB_SLUG="${GITHUB_SLUG:-<owner>/greenbone-update}"
 IS_ROOT=0; [ "$(id -u)" -eq 0 ] && IS_ROOT=1
 
 if [ "$IS_ROOT" -eq 1 ]; then
-  PREFIX="${PREFIX:-/usr/local}"
-  SBIN_DIR="${SBIN_DIR:-$PREFIX/sbin}"
-  CONFIG_DIR="${CONFIG_DIR:-/etc/greenbone}"
-  DATA_DIR="${DATA_DIR:-/opt/greenbone/community-container}"
-  LOG_DIR="${LOG_DIR:-/var/log}"
-  LOCK_DIR="${LOCK_DIR:-/var/lock}"
-  RUN_USER="${RUN_USER:-root}"
+    PREFIX="${PREFIX:-/usr/local}"
+    SBIN_DIR="${SBIN_DIR:-$PREFIX/sbin}"
+    CONFIG_DIR="${CONFIG_DIR:-/etc/greenbone}"
+    DATA_DIR="${DATA_DIR:-/opt/greenbone/community-container}"
+    LOG_DIR="${LOG_DIR:-/var/log}"
+    LOCK_DIR="${LOCK_DIR:-/var/lock}"
+    RUN_USER="${RUN_USER:-root}"
 else
-  PREFIX="${PREFIX:-$HOME/.local}"
-  SBIN_DIR="${SBIN_DIR:-$PREFIX/bin}"
-  CONFIG_DIR="${CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/greenbone}"
-  DATA_DIR="${DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/greenbone/community-container}"
-  LOG_DIR="${LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/greenbone}"
-  LOCK_DIR="${LOCK_DIR:-${XDG_RUNTIME_DIR:-/tmp}}"
-  RUN_USER="${RUN_USER:-$(id -un)}"
+    PREFIX="${PREFIX:-$HOME/.local}"
+    SBIN_DIR="${SBIN_DIR:-$PREFIX/bin}"
+    CONFIG_DIR="${CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/greenbone}"
+    DATA_DIR="${DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/greenbone/community-container}"
+    LOG_DIR="${LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/greenbone}"
+    LOCK_DIR="${LOCK_DIR:-${XDG_RUNTIME_DIR:-/tmp}}"
+    RUN_USER="${RUN_USER:-$(id -un)}"
 fi
 
 CONFIG_FILE="${CONFIG_FILE:-$CONFIG_DIR/update.env}"
@@ -115,33 +115,33 @@ ${c_r}[x]${c_0} This installer must run as root.
 
     Run '$0 --help' for the full list of options.
 EOF
-  exit 1
+    exit 1
 }
 
 #------------------------------------------------------------------ arg parsing
 while [ $# -gt 0 ]; do
-  case "$1" in
-    --host)        NGINX_HOST="${2:?}"; shift 2 ;;
-    --port)        NGINX_HTTP_PORT="${2:?}"; shift 2 ;;
-    --project)     PROJECT="${2:?}"; shift 2 ;;
-    --prefix)      PREFIX="${2:?}"; SBIN_DIR="$PREFIX/sbin"; [ "$IS_ROOT" -eq 0 ] && SBIN_DIR="$PREFIX/bin"; shift 2 ;;
-    --sbin-dir)    SBIN_DIR="${2:?}"; shift 2 ;;
-    --config-dir)  CONFIG_DIR="${2:?}"; CONFIG_FILE="$CONFIG_DIR/update.env"; shift 2 ;;
-    --data-dir)    DATA_DIR="${2:?}"; BACKUP_DIR="$DATA_DIR/backups"; shift 2 ;;
-    --log-file)    LOG_FILE="${2:?}"; LOG_DIR="$(dirname "$LOG_FILE")"; shift 2 ;;
-    --lock-file)   LOCK_FILE="${2:?}"; LOCK_DIR="$(dirname "$LOCK_FILE")"; shift 2 ;;
-    --user)        RUN_USER="${2:?}"; shift 2 ;;
-    --scheduler)   SCHEDULER="${2:?}"; shift 2 ;;
-    --schedule)    CRON_SCHEDULE="${2:?}"; shift 2 ;;
-    --oncalendar)  SYSTEMD_ONCALENDAR="${2:?}"; shift 2 ;;
-    --mailto)      CRON_MAILTO="${2:?}"; shift 2 ;;
-    --github-slug) GITHUB_SLUG="${2:?}"; shift 2 ;;
-    --user-mode)   USER_MODE=1; shift ;;
-    --force)       FORCE=1; shift ;;
-    --dry-run)     DRY_RUN=1; shift ;;
-    -h|--help)     usage; exit 0 ;;
-    *)             usage; die "unknown parameter: $1" ;;
-  esac
+    case "$1" in
+        --host)        NGINX_HOST="${2:?}"; shift 2 ;;
+        --port)        NGINX_HTTP_PORT="${2:?}"; shift 2 ;;
+        --project)     PROJECT="${2:?}"; shift 2 ;;
+        --prefix)      PREFIX="${2:?}"; SBIN_DIR="$PREFIX/sbin"; [ "$IS_ROOT" -eq 0 ] && SBIN_DIR="$PREFIX/bin"; shift 2 ;;
+        --sbin-dir)    SBIN_DIR="${2:?}"; shift 2 ;;
+        --config-dir)  CONFIG_DIR="${2:?}"; CONFIG_FILE="$CONFIG_DIR/update.env"; shift 2 ;;
+        --data-dir)    DATA_DIR="${2:?}"; BACKUP_DIR="$DATA_DIR/backups"; shift 2 ;;
+        --log-file)    LOG_FILE="${2:?}"; LOG_DIR="$(dirname "$LOG_FILE")"; shift 2 ;;
+        --lock-file)   LOCK_FILE="${2:?}"; LOCK_DIR="$(dirname "$LOCK_FILE")"; shift 2 ;;
+        --user)        RUN_USER="${2:?}"; shift 2 ;;
+        --scheduler)   SCHEDULER="${2:?}"; shift 2 ;;
+        --schedule)    CRON_SCHEDULE="${2:?}"; shift 2 ;;
+        --oncalendar)  SYSTEMD_ONCALENDAR="${2:?}"; shift 2 ;;
+        --mailto)      CRON_MAILTO="${2:?}"; shift 2 ;;
+        --github-slug) GITHUB_SLUG="${2:?}"; shift 2 ;;
+        --user-mode)   USER_MODE=1; shift ;;
+        --force)       FORCE=1; shift ;;
+        --dry-run)     DRY_RUN=1; shift ;;
+        -h|--help)     usage; exit 0 ;;
+        *)             usage; die "unknown parameter: $1" ;;
+    esac
 done
 
 # Root is required unless the user explicitly asked for a home-directory install.
@@ -155,13 +155,13 @@ CONFIG_FILE="$CONFIG_DIR/update.env"
 [ -f "$SRC_DIR/bin/greenbone-update.sh" ] || die "incomplete repo layout: bin/greenbone-update.sh"
 
 if [ -z "$NGINX_HOST" ]; then
-  if [ -r "$CONFIG_FILE" ]; then
-    NGINX_HOST=$(. "$CONFIG_FILE" 2>/dev/null; printf '%s' "${NGINX_HOST:-}")
-    [ -n "$NGINX_HOST" ] && info "host taken from existing config: $NGINX_HOST"
-  fi
+    if [ -r "$CONFIG_FILE" ]; then
+        NGINX_HOST=$(. "$CONFIG_FILE" 2>/dev/null; printf '%s' "${NGINX_HOST:-}")
+        [ -n "$NGINX_HOST" ] && info "host taken from existing config: $NGINX_HOST"
+    fi
 fi
 if [ -z "$NGINX_HOST" ]; then
-  usage
+    usage
   cat >&2 <<EOF
 
 ${c_r}[x]${c_0} --host is required.
@@ -175,42 +175,51 @@ ${c_r}[x]${c_0} --host is required.
     No existing config was found at $CONFIG_FILE,
     so there is nothing to reuse the previous value from.
 EOF
-  exit 1
+    exit 1
 fi
 
-case "$NGINX_HTTP_PORT" in ''|*[!0-9]*) die "invalid port: $NGINX_HTTP_PORT" ;; esac
+case "$NGINX_HTTP_PORT" in
+    ''|*[!0-9]*) die "invalid port: $NGINX_HTTP_PORT" ;;
+esac
 [ "$(printf '%s\n' "$CRON_SCHEDULE" | awk '{print NF}')" -eq 5 ] \
-  || die "cron expression must have 5 fields: '$CRON_SCHEDULE'"
+|| die "cron expression must have 5 fields: '$CRON_SCHEDULE'"
 
 id -u "$RUN_USER" >/dev/null 2>&1 || die "no such user: $RUN_USER"
 RUN_GROUP="$(id -gn "$RUN_USER")"
 
 check_deps() {
-  local miss=""
-  for c in docker curl sed awk flock stat; do
+local miss=""
+for c in docker curl sed awk flock stat; do
     command -v "$c" >/dev/null 2>&1 || miss="$miss $c"
-  done
-  [ -n "$miss" ] && warn "missing command(s):$miss - install them before the script runs"
-  if command -v docker >/dev/null 2>&1; then
+done
+[ -n "$miss" ] && warn "missing command(s):$miss - install them before the script runs"
+if command -v docker >/dev/null 2>&1; then
     docker compose version >/dev/null 2>&1 || warn "docker compose v2 plugin not found (v1 is not supported)"
     if [ "$RUN_USER" != "root" ] && ! id -nG "$RUN_USER" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
-      warn "$RUN_USER is not in the 'docker' group; the script may not be able to reach docker"
+        warn "$RUN_USER is not in the 'docker' group; the script may not be able to reach docker"
     fi
-  fi
-  command -v yq >/dev/null 2>&1 || warn "yq not found - the sed fallback patch will be used (yq recommended)"
+fi
+command -v yq >/dev/null 2>&1 || warn "yq not found - the sed fallback patch will be used (yq recommended)"
 }
 
 #-------------------------------------------------------------- cron -> OnCalendar
 cron_to_oncalendar() {
-  local m h dom mon dow days
+local m h dom mon dow days
   read -r m h dom mon dow <<<"$1"
-  case "$m$h" in *[!0-9]*) printf 'weekly'; return ;; esac
+    case "$m$h" in
+        *[!0-9]*) printf 'weekly'; return ;;
+    esac
   local hhmm; hhmm=$(printf '%02d:%02d:00' "$h" "$m")
   if [ "$dom" = "*" ] && [ "$mon" = "*" ]; then
     if [ "$dow" = "*" ]; then printf '*-*-*%s' " $hhmm"; return; fi
     case "$dow" in
-      0|7) days=Sun ;; 1) days=Mon ;; 2) days=Tue ;; 3) days=Wed ;;
-      4) days=Thu ;; 5) days=Fri ;; 6) days=Sat ;;
+      0|7) days=Sun ;;
+      1) days=Mon ;;
+      2) days=Tue ;;
+      3) days=Wed ;;
+      4) days=Thu ;;
+      5) days=Fri ;;
+      6) days=Sat ;;
       *) printf 'weekly'; return ;;
     esac
     printf '%s *-*-* %s' "$days" "$hhmm"; return
@@ -230,7 +239,10 @@ detect_scheduler() {
   fi
 }
 [ "$SCHEDULER" = "auto" ] && SCHEDULER="$(detect_scheduler)"
-case "$SCHEDULER" in systemd|cron|none) ;; *) die "invalid --scheduler: $SCHEDULER" ;; esac
+case "$SCHEDULER" in
+    systemd|cron|none) ;;
+    *) die "invalid --scheduler: $SCHEDULER" ;;
+esac
 if [ "$SCHEDULER" = "systemd" ] && { [ ! -d /run/systemd/system ] || [ "$IS_ROOT" -eq 0 ]; }; then
   warn "systemd is not usable, falling back to cron"; SCHEDULER="cron"
 fi
