@@ -1,0 +1,8 @@
+# Greenbone Community Edition update - managed by install.sh
+# DO NOT EDIT MANUALLY (regenerate with install.sh --schedule ...)
+SHELL=/bin/bash
+PATH=@SBIN_DIR@:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+MAILTO=@CRON_MAILTO@
+GB_CONFIG_FILE=@CONFIG_FILE@
+
+@CRON_SCHEDULE@ @RUN_USER@ @SBIN_DIR@/greenbone-update.sh >/dev/null 2>&1

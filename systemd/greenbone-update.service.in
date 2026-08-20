@@ -1,0 +1,22 @@
+[Unit]
+Description=Greenbone Community Edition update (software + feed)
+Documentation=https://github.com/@GITHUB_SLUG@
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=@RUN_USER@
+Environment=GB_CONFIG_FILE=@CONFIG_FILE@
+ExecStart=@SBIN_DIR@/greenbone-update.sh
+TimeoutStartSec=3600
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+NoNewPrivileges=true
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

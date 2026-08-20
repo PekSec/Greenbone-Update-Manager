@@ -1,0 +1,10 @@
+@LOG_FILE@ {
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 @RUN_USER@ @RUN_GROUP@
+    su @RUN_USER@ @RUN_GROUP@
+}

@@ -1,0 +1,13 @@
+[Unit]
+Description=Weekly Greenbone Community Edition update
+Documentation=https://github.com/@GITHUB_SLUG@
+
+[Timer]
+OnCalendar=@SYSTEMD_ONCALENDAR@
+RandomizedDelaySec=1800
+Persistent=true
+AccuracySec=1min
+Unit=greenbone-update.service
+
+[Install]
+WantedBy=timers.target
