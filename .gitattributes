@@ -1,0 +1,8 @@
+# Shell scripts, systemd/cron/logrotate units and config templates are consumed
+# on Linux; CRLF breaks shebangs and unit parsing. Force LF everywhere.
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.in   text eol=lf
+*.env  text eol=lf
+*.example text eol=lf

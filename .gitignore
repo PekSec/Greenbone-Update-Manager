@@ -1,0 +1,22 @@
+# Runtime config - SENSITIVE, never commit
+config/update.env
+*.env
+!config/update.env.example
+
+# Generated / downloaded files
+compose.yaml
+compose.yaml.*
+backups/
+*.log
+*.log.*
+*.bak
+*.bak.*
+.compose.*
+graphify*
+
+# Editor / OS
+.DS_Store
+*.swp
+*~
+.claude/
+.codex/
