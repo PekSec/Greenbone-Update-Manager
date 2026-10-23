@@ -5,6 +5,6 @@
     delaycompress
     missingok
     notifempty
-    create 0640 @RUN_USER@ @RUN_GROUP@
+    create 0600 @RUN_USER@ @RUN_GROUP@
     su @RUN_USER@ @RUN_GROUP@
 }

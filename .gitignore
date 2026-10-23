@@ -12,6 +12,15 @@ backups/
 *.bak
 *.bak.*
 .compose.*
+gmp-credentials*.json
+current.json
+attempt.json
+incomplete-operation.json
+last-upgrade-backup
+releases/
+*.tar
+*.partial
+__pycache__/
 graphify*
 
 # Editor / OS

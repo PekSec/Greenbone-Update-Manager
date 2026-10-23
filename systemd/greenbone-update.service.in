@@ -1,6 +1,6 @@
 [Unit]
-Description=Greenbone Community Edition update (software + feed)
-Documentation=https://github.com/@GITHUB_SLUG@
+Description=Greenbone maintenance: @JOB_COMMAND@
+Documentation=https://github.com/PekSec/Greenbone-Update-Manager
 After=docker.service network-online.target
 Wants=network-online.target
 Requires=docker.service
@@ -9,14 +9,11 @@ Requires=docker.service
 Type=oneshot
 User=@RUN_USER@
 Environment=GB_CONFIG_FILE=@CONFIG_FILE@
-ExecStart=@SBIN_DIR@/greenbone-update.sh
-TimeoutStartSec=3600
+ExecStart=@SBIN_DIR@/greenbone-update.sh @JOB_COMMAND@
+TimeoutStartSec=0
+UMask=0077
 Nice=10
-IOSchedulingClass=best-effort
-IOSchedulingPriority=6
 NoNewPrivileges=true
-ProtectHome=read-only
 PrivateTmp=true
-
-[Install]
-WantedBy=multi-user.target
+# Per-command timeouts are enforced by the maintenance engine. Do not kill an
+# archive/migration at an arbitrary systemd timeout; incomplete work stays gated.

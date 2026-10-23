@@ -1,398 +1,230 @@
 #!/usr/bin/env bash
-#==============================================================================
-# greenbone-update - installer
-#
-# Distribution/user/directory agnostic. All paths are variables; when not run
-# as root it installs into the XDG directories. Scheduler: systemd timer if
-# available, otherwise cron.
-#
-#   sudo ./install.sh --host 10.0.0.1
-#   sudo ./install.sh --host gvm.local --port 8080 --schedule "0 4 * * 0"
-#   sudo ./install.sh --host 10.0.0.1 --scheduler cron --dry-run
-#   ./install.sh --host 10.0.0.1 --user-mode  # non-root -> under ~/.local
-#==============================================================================
+# Install maintenance tooling only. Never deploy a Greenbone stack.
 set -Eeuo pipefail
-
+umask 077
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-GITHUB_SLUG="${GITHUB_SLUG:-<owner>/greenbone-update}"
-
-#------------------------------------------------------------------- defaults
-IS_ROOT=0; [ "$(id -u)" -eq 0 ] && IS_ROOT=1
-
-if [ "$IS_ROOT" -eq 1 ]; then
+IS_ROOT=0
+[[ "$(id -u)" -ne 0 ]] || IS_ROOT=1
+if [[ "$IS_ROOT" == 1 ]]; then
     PREFIX="${PREFIX:-/usr/local}"
     SBIN_DIR="${SBIN_DIR:-$PREFIX/sbin}"
     CONFIG_DIR="${CONFIG_DIR:-/etc/greenbone}"
     DATA_DIR="${DATA_DIR:-/opt/greenbone/community-container}"
-    LOG_DIR="${LOG_DIR:-/var/log}"
-    LOCK_DIR="${LOCK_DIR:-/var/lock}"
+    LOG_FILE="${LOG_FILE:-/var/log/greenbone-update.log}"
     RUN_USER="${RUN_USER:-root}"
 else
     PREFIX="${PREFIX:-$HOME/.local}"
     SBIN_DIR="${SBIN_DIR:-$PREFIX/bin}"
     CONFIG_DIR="${CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/greenbone}"
     DATA_DIR="${DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/greenbone/community-container}"
-    LOG_DIR="${LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/greenbone}"
-    LOCK_DIR="${LOCK_DIR:-${XDG_RUNTIME_DIR:-/tmp}}"
+    LOG_FILE="${LOG_FILE:-${XDG_STATE_HOME:-$HOME/.local/state}/greenbone/greenbone-update.log}"
     RUN_USER="${RUN_USER:-$(id -un)}"
 fi
-
-CONFIG_FILE="${CONFIG_FILE:-$CONFIG_DIR/update.env}"
-BACKUP_DIR="${BACKUP_DIR:-$DATA_DIR/backups}"
-LOG_FILE="${LOG_FILE:-$LOG_DIR/greenbone-update.log}"
-LOCK_FILE="${LOCK_FILE:-$LOCK_DIR/greenbone-update.lock}"
-
-PROJECT="${PROJECT:-greenbone-community-edition}"
-NGINX_HOST="${NGINX_HOST:-}"
-NGINX_HTTP_PORT="${NGINX_HTTP_PORT:-80}"
-
-SCHEDULER="${SCHEDULER:-auto}"          # auto|systemd|cron|none
-CRON_SCHEDULE="${CRON_SCHEDULE:-0 3 * * 0}"
+SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
+CRON_DIR="${CRON_DIR:-/etc/cron.d}"
+LOGROTATE_DIR="${LOGROTATE_DIR:-/etc/logrotate.d}"
+SCHEDULER="${SCHEDULER:-auto}"
+CRON_SCHEDULE="${CRON_SCHEDULE:-0 3 * * *}"
 SYSTEMD_ONCALENDAR="${SYSTEMD_ONCALENDAR:-}"
-CRON_MAILTO="${CRON_MAILTO:-root}"
-DRY_RUN=0; FORCE=0; USER_MODE=0
-
-#-------------------------------------------------------------------- helpers
-c_r=""; c_g=""; c_y=""; c_0=""
-if [ -t 1 ]; then c_r=$'\033[31m'; c_g=$'\033[32m'; c_y=$'\033[33m'; c_0=$'\033[0m'; fi
-info() { printf '%s[*]%s %s\n' "$c_g" "$c_0" "$*"; }
-warn() { printf '%s[!]%s %s\n' "$c_y" "$c_0" "$*" >&2; }
-die()  { printf '%s[x]%s %s\n' "$c_r" "$c_0" "$*" >&2; exit 1; }
-run()  { if [ "$DRY_RUN" -eq 1 ]; then printf '    [dry] %s\n' "$*"; else "$@"; fi; }
-
+CRON_MAILTO="${CRON_MAILTO:-$RUN_USER}"
+NGINX_HOST="${NGINX_HOST:-localhost}"
+NGINX_HTTP_PORT="${NGINX_HTTP_PORT:-9392}"
+PROJECT="${PROJECT:-greenbone-community-edition}"
+LOCK_FILE="${LOCK_FILE:-}"
+DRY_RUN=0
+USER_MODE=0
+FORCE=0
 usage() {
-  cat <<EOF
-Usage: sudo $0 --host <IP|FQDN> [options]
-
-Required (on first install):
-  --host <val>            Host/IP the Greenbone web interface is published on.
-                          Re-installs reuse the value already in the config file.
-
-Paths and identity:
-  --prefix <dir>          Install prefix, sets --sbin-dir (default: $PREFIX)
-  --sbin-dir <dir>        Where greenbone-update.sh is installed (default: $SBIN_DIR)
-  --config-dir <dir>      Holds update.env, mode 0600 (default: $CONFIG_DIR)
-  --data-dir <dir>        compose.yaml + timestamped backups (default: $DATA_DIR)
-  --log-file <path>       Log file (default: $LOG_FILE)
-  --lock-file <path>      flock file, one run at a time (default: $LOCK_FILE)
-  --user <name>           User the scheduled job runs as (default: $RUN_USER)
-  --user-mode             Install into your home directory instead of system-wide.
-                          Required to run this installer without root.
-
-Stack:
-  --port <n>              HTTP port the web interface is published on (default: $NGINX_HTTP_PORT)
-  --project <name>        docker compose project name (default: $PROJECT)
-
-Scheduling:
-  --scheduler <mode>      auto|systemd|cron|none (default: $SCHEDULER)
-                          auto = systemd timer if available, else cron
-  --schedule <cron>       5-field cron expression (default: "$CRON_SCHEDULE")
-  --oncalendar <val>      systemd OnCalendar, derived from --schedule if omitted
-  --mailto <addr>         cron MAILTO (default: $CRON_MAILTO)
-
-Other:
-  --github-slug <o/repo>  owner/repo used in the systemd Documentation= URL
-                          (default: $GITHUB_SLUG)
-  --force                 Overwrite an existing config file instead of keeping it
-  --dry-run               Write nothing, list what would be done
-  -h|--help               This help
-
-Every option can also be given as an environment variable:
-  PREFIX=/opt/tools sudo -E $0 --host 10.0.0.1
-EOF
+    cat <<'HELP'
+Usage: ./install.sh [--user-mode] [options]
+Installs tooling and schedules; does not install Docker or deploy Greenbone.
+  --scheduler auto|systemd|cron|none
+  --prefix DIR --sbin-dir DIR --config-dir DIR --data-dir DIR
+  --log-file PATH --lock-file PATH --project NAME --user USER
+  --schedule 'M H * * D'     Feed cron schedule (default: daily 03:00)
+  --oncalendar VALUE        Explicit systemd feed calendar
+  --mailto ADDRESS         Cron error/output recipient
+  --host HOST --port PORT   Kept as metadata; edit reviewed Compose for networking
+  --force                  Preserve old config as a backup and replace it
+  --dry-run                No file, timer, crontab or Docker changes
+  --help
+Backup: daily 02:00; feed: daily 03:00; version report: Sunday 05:00.
+Maintenance is disabled until AUTO_WINDOW_UTC and AUTO_WINDOW_ACK are configured.
+HELP
 }
-
-require_root() {
-  cat >&2 <<EOF
-${c_r}[x]${c_0} This installer must run as root.
-
-    Re-run:  sudo $0 --host <IP|FQDN>
-
-    To install into your home directory instead,
-    pass --user-mode explicitly:
-
-             $0 --host <IP|FQDN> --user-mode
-
-    Run '$0 --help' for the full list of options.
-EOF
-    exit 1
-}
-
-#------------------------------------------------------------------ arg parsing
-while [ $# -gt 0 ]; do
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 64; }
+run() { if [[ "$DRY_RUN" == 1 ]]; then printf '[dry-run] %s\n' "$*"; else "$@"; fi; }
+while [[ $# -gt 0 ]]; do
     case "$1" in
-        --host)        NGINX_HOST="${2:?}"; shift 2 ;;
-        --port)        NGINX_HTTP_PORT="${2:?}"; shift 2 ;;
-        --project)     PROJECT="${2:?}"; shift 2 ;;
-        --prefix)      PREFIX="${2:?}"; SBIN_DIR="$PREFIX/sbin"; [ "$IS_ROOT" -eq 0 ] && SBIN_DIR="$PREFIX/bin"; shift 2 ;;
-        --sbin-dir)    SBIN_DIR="${2:?}"; shift 2 ;;
-        --config-dir)  CONFIG_DIR="${2:?}"; CONFIG_FILE="$CONFIG_DIR/update.env"; shift 2 ;;
-        --data-dir)    DATA_DIR="${2:?}"; BACKUP_DIR="$DATA_DIR/backups"; shift 2 ;;
-        --log-file)    LOG_FILE="${2:?}"; LOG_DIR="$(dirname "$LOG_FILE")"; shift 2 ;;
-        --lock-file)   LOCK_FILE="${2:?}"; LOCK_DIR="$(dirname "$LOCK_FILE")"; shift 2 ;;
-        --user)        RUN_USER="${2:?}"; shift 2 ;;
-        --scheduler)   SCHEDULER="${2:?}"; shift 2 ;;
-        --schedule)    CRON_SCHEDULE="${2:?}"; shift 2 ;;
-        --oncalendar)  SYSTEMD_ONCALENDAR="${2:?}"; shift 2 ;;
-        --mailto)      CRON_MAILTO="${2:?}"; shift 2 ;;
-        --github-slug) GITHUB_SLUG="${2:?}"; shift 2 ;;
-        --user-mode)   USER_MODE=1; shift ;;
-        --force)       FORCE=1; shift ;;
-        --dry-run)     DRY_RUN=1; shift ;;
-        -h|--help)     usage; exit 0 ;;
-        *)             usage; die "unknown parameter: $1" ;;
+        --help|-h) usage; exit 0 ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --force) FORCE=1; shift ;;
+        --user-mode) USER_MODE=1; shift ;;
+        --prefix) PREFIX="${2:?}"; SBIN_DIR="$PREFIX/sbin"; [[ "$IS_ROOT" == 1 ]] || SBIN_DIR="$PREFIX/bin"; shift 2 ;;
+        --sbin-dir) SBIN_DIR="${2:?}"; shift 2 ;;
+        --config-dir) CONFIG_DIR="${2:?}"; shift 2 ;;
+        --data-dir) DATA_DIR="${2:?}"; shift 2 ;;
+        --log-file) LOG_FILE="${2:?}"; shift 2 ;;
+        --lock-file) LOCK_FILE="${2:?}"; shift 2 ;;
+        --project) PROJECT="${2:?}"; shift 2 ;;
+        --user) RUN_USER="${2:?}"; shift 2 ;;
+        --scheduler) SCHEDULER="${2:?}"; shift 2 ;;
+        --schedule) CRON_SCHEDULE="${2:?}"; shift 2 ;;
+        --oncalendar) SYSTEMD_ONCALENDAR="${2:?}"; shift 2 ;;
+        --mailto) CRON_MAILTO="${2:?}"; shift 2 ;;
+        --host) NGINX_HOST="${2:?}"; shift 2 ;;
+        --port) NGINX_HTTP_PORT="${2:?}"; shift 2 ;;
+        --github-slug) shift 2 ;; # Compatibility with the former installer.
+        *) die "Unknown option; run --help" ;;
     esac
 done
-
-# Root is required unless the user explicitly asked for a home-directory install.
-[ "$IS_ROOT" -eq 1 ] || [ "$USER_MODE" -eq 1 ] || require_root
-
-# refresh derived paths after --prefix
-BACKUP_DIR="$DATA_DIR/backups"
+[[ "$IS_ROOT" == 1 || "$USER_MODE" == 1 || "$DRY_RUN" == 1 ]] || die 'Run as root or pass --user-mode'
+[[ "$IS_ROOT" == 1 || "$RUN_USER" == "$(id -un)" ]] || die 'User-mode installation cannot target another user'
 CONFIG_FILE="$CONFIG_DIR/update.env"
-
-#--------------------------------------------------------------------- checks
-[ -f "$SRC_DIR/bin/greenbone-update.sh" ] || die "incomplete repo layout: bin/greenbone-update.sh"
-
-if [ -z "$NGINX_HOST" ]; then
-    if [ -r "$CONFIG_FILE" ]; then
-        NGINX_HOST=$(. "$CONFIG_FILE" 2>/dev/null; printf '%s' "${NGINX_HOST:-}")
-        [ -n "$NGINX_HOST" ] && info "host taken from existing config: $NGINX_HOST"
-    fi
-fi
-if [ -z "$NGINX_HOST" ]; then
-    usage
-  cat >&2 <<EOF
-
-${c_r}[x]${c_0} --host is required.
-
-    It is the host or IP the Greenbone web interface will be published on,
-    and it is the one value this installer cannot guess. Example:
-
-        sudo $0 --host 10.0.0.1
-        sudo $0 --host gvm.example.local --port 8080
-
-    No existing config was found at $CONFIG_FILE,
-    so there is nothing to reuse the previous value from.
-EOF
-    exit 1
-fi
-
-case "$NGINX_HTTP_PORT" in
-    ''|*[!0-9]*) die "invalid port: $NGINX_HTTP_PORT" ;;
-esac
-[ "$(printf '%s\n' "$CRON_SCHEDULE" | awk '{print NF}')" -eq 5 ] \
-|| die "cron expression must have 5 fields: '$CRON_SCHEDULE'"
-
-id -u "$RUN_USER" >/dev/null 2>&1 || die "no such user: $RUN_USER"
-RUN_GROUP="$(id -gn "$RUN_USER")"
-
-check_deps() {
-local miss=""
-for c in docker curl sed awk flock stat; do
-    command -v "$c" >/dev/null 2>&1 || miss="$miss $c"
+BACKUP_DIR="$DATA_DIR/backups"
+LIB_DIR="$SBIN_DIR/greenbone-maintenance"
+LOCK_FILE="${LOCK_FILE:-$DATA_DIR/maintenance.lock}"
+for value in "$SBIN_DIR" "$CONFIG_DIR" "$DATA_DIR" "$LOG_FILE" "$LOCK_FILE" "$SYSTEMD_DIR" "$CRON_DIR" "$LOGROTATE_DIR"; do
+    [[ "$value" =~ ^/[a-zA-Z0-9_./:+-]+$ && "$value" != / ]] || die 'Paths must be absolute, without spaces or shell metacharacters'
 done
-[ -n "$miss" ] && warn "missing command(s):$miss - install them before the script runs"
-if command -v docker >/dev/null 2>&1; then
-    docker compose version >/dev/null 2>&1 || warn "docker compose v2 plugin not found (v1 is not supported)"
-    if [ "$RUN_USER" != "root" ] && ! id -nG "$RUN_USER" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
-        warn "$RUN_USER is not in the 'docker' group; the script may not be able to reach docker"
+[[ "$PROJECT" =~ ^[a-z0-9][a-z0-9_.-]{0,63}$ ]] || die 'Invalid project name'
+[[ "$NGINX_HOST" =~ ^[a-zA-Z0-9_.:-]+$ ]] || die 'Invalid host metadata'
+[[ "$NGINX_HTTP_PORT" =~ ^[0-9]{1,5}$ ]] || die 'Invalid port'
+((10#$NGINX_HTTP_PORT > 0 && 10#$NGINX_HTTP_PORT <= 65535)) || die 'Invalid port range'
+[[ "$CRON_MAILTO" =~ ^[a-zA-Z0-9_.@+-]+$ ]] || die 'Invalid mail recipient'
+id "$RUN_USER" >/dev/null 2>&1 || die 'Run user does not exist'
+RUN_GROUP="$(id -gn "$RUN_USER")"
+command -v python3 >/dev/null || die 'Python 3 is required'
+# Do not silently translate a cron expression to a different systemd schedule.
+read -r minute hour dom month dow extra <<<"$CRON_SCHEDULE"
+[[ -z "${extra:-}" && "$minute" =~ ^[0-5]?[0-9]$ && "$hour" =~ ^([01]?[0-9]|2[0-3])$ && "$dom" == '*' && "$month" == '*' && "$dow" =~ ^([0-7]|\*)$ ]] || die 'Use M H * * D (one weekday or *) for --schedule'
+if [[ -z "$SYSTEMD_ONCALENDAR" ]]; then
+    days=(Sun Mon Tue Wed Thu Fri Sat Sun)
+    day=''
+    [[ "$dow" == '*' ]] || day="${days[$dow]} "
+    printf -v SYSTEMD_ONCALENDAR '%s*-*-* %02d:%02d:00' "$day" "$((10#$hour))" "$((10#$minute))"
+fi
+[[ "$SYSTEMD_ONCALENDAR" != *$'\n'* && "$SYSTEMD_ONCALENDAR" != *$'\r'* ]] || die 'Invalid calendar'
+if [[ "$SCHEDULER" == auto ]]; then
+    if [[ "$IS_ROOT" == 1 && -d /run/systemd/system ]] && command -v systemctl >/dev/null; then
+        SCHEDULER=systemd
+    elif command -v crontab >/dev/null || [[ "$IS_ROOT" == 1 && -d "$CRON_DIR" ]]; then
+        SCHEDULER=cron
+    else SCHEDULER=none; fi
+fi
+case "$SCHEDULER" in
+    systemd) [[ "$IS_ROOT" == 1 ]] || die 'systemd scheduling requires root; use cron for user mode' ;;
+    cron|none) ;;
+    *) die 'Unknown scheduler' ;;
+esac
+export SBIN_DIR CONFIG_DIR CONFIG_FILE DATA_DIR BACKUP_DIR LIB_DIR LOG_FILE LOCK_FILE RUN_USER RUN_GROUP PROJECT NGINX_HOST NGINX_HTTP_PORT CRON_SCHEDULE CRON_MAILTO SYSTEMD_ONCALENDAR
+render() {
+    local source="$1" dest="$2" mode="$3"
+    if [[ "$DRY_RUN" == 1 ]]; then printf '[dry-run] render %s -> %s\n' "$source" "$dest"; return; fi
+    python3 - "$source" "$dest" "$mode" <<'PY'
+import os, pathlib, re, sys, tempfile
+source, dest, mode = sys.argv[1:]
+text = pathlib.Path(source).read_text()
+text = re.sub(r'@([A-Z_]+)@', lambda m: os.environ[m[1]], text)
+assert not re.search(r'@[A-Z_]+@', text)
+fd, temporary = tempfile.mkstemp(dir=pathlib.Path(dest).parent)
+try:
+    with os.fdopen(fd, 'w') as output:
+        output.write(text)
+    os.chmod(temporary, int(mode, 8))
+    os.replace(temporary, dest)
+finally:
+    if os.path.exists(temporary): os.unlink(temporary)
+PY
+}
+filter_crontab() {
+    python3 -c 'import sys; print("".join(line for line in sys.stdin if "greenbone-update.sh" not in line and "# greenbone-update (managed by install.sh)" not in line), end="")'
+}
+# Disable legacy software updates before replacing any executable. Never kill a
+# running legacy upgrade: it may already be migrating the database.
+if [[ "$IS_ROOT" == 1 ]]; then
+    if [[ -f "$SYSTEMD_DIR/greenbone-update.timer" ]]; then
+        run systemctl disable --now greenbone-update.timer
+        if [[ "$DRY_RUN" == 0 ]] && systemctl is-active --quiet greenbone-update.service; then
+            die 'Legacy update is active; wait for completion, inspect its result, then retry'
+        fi
+        run rm -f "$SYSTEMD_DIR/greenbone-update.timer" "$SYSTEMD_DIR/greenbone-update.service"
+    fi
+    run rm -f "$CRON_DIR/greenbone-update"
+fi
+if command -v crontab >/dev/null; then
+    cron_args=()
+    [[ "$IS_ROOT" == 0 ]] || cron_args=(-u "$RUN_USER")
+    old_cron=''
+    if old_cron=$(crontab "${cron_args[@]}" -l 2>/dev/null); then :
+    else rc=$?; [[ "$rc" == 1 ]] || die 'Could not read crontab'; fi
+    filtered=$(printf '%s\n' "$old_cron" | filter_crontab)
+    if [[ "$filtered" != "$old_cron" ]]; then
+        if [[ "$DRY_RUN" == 1 ]]; then printf '[dry-run] remove legacy maintenance crontab entries\n'
+        else printf '%s\n' "$filtered" | crontab "${cron_args[@]}" -; fi
     fi
 fi
-command -v yq >/dev/null 2>&1 || warn "yq not found - the sed fallback patch will be used (yq recommended)"
-}
-
-#-------------------------------------------------------------- cron -> OnCalendar
-cron_to_oncalendar() {
-local m h dom mon dow days
-  read -r m h dom mon dow <<<"$1"
-    case "$m$h" in
-        *[!0-9]*) printf 'weekly'; return ;;
-    esac
-  local hhmm; hhmm=$(printf '%02d:%02d:00' "$h" "$m")
-  if [ "$dom" = "*" ] && [ "$mon" = "*" ]; then
-    if [ "$dow" = "*" ]; then printf '*-*-*%s' " $hhmm"; return; fi
-    case "$dow" in
-      0|7) days=Sun ;;
-      1) days=Mon ;;
-      2) days=Tue ;;
-      3) days=Wed ;;
-      4) days=Thu ;;
-      5) days=Fri ;;
-      6) days=Sat ;;
-      *) printf 'weekly'; return ;;
-    esac
-    printf '%s *-*-* %s' "$days" "$hhmm"; return
-  fi
-  printf '*-*-* %s' "$hhmm"
-}
-[ -n "$SYSTEMD_ONCALENDAR" ] || SYSTEMD_ONCALENDAR="$(cron_to_oncalendar "$CRON_SCHEDULE")"
-
-#---------------------------------------------------------- scheduler detection
-detect_scheduler() {
-  if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1 && [ "$IS_ROOT" -eq 1 ]; then
-    printf 'systemd'
-  elif command -v crontab >/dev/null 2>&1 || [ -d /etc/cron.d ]; then
-    printf 'cron'
-  else
-    printf 'none'
-  fi
-}
-[ "$SCHEDULER" = "auto" ] && SCHEDULER="$(detect_scheduler)"
-case "$SCHEDULER" in
-    systemd|cron|none) ;;
-    *) die "invalid --scheduler: $SCHEDULER" ;;
-esac
-if [ "$SCHEDULER" = "systemd" ] && { [ ! -d /run/systemd/system ] || [ "$IS_ROOT" -eq 0 ]; }; then
-  warn "systemd is not usable, falling back to cron"; SCHEDULER="cron"
+# Disable previously managed timers when switching schedulers or reinstalling.
+if [[ "$IS_ROOT" == 1 ]]; then
+    for job in feed backup version-check; do
+        if [[ -f "$SYSTEMD_DIR/greenbone-$job.timer" ]]; then run systemctl disable --now "greenbone-$job.timer"; fi
+        if [[ "$DRY_RUN" == 0 ]] && [[ -f "$SYSTEMD_DIR/greenbone-$job.service" ]] && systemctl is-active --quiet "greenbone-$job.service"; then
+            die 'Maintenance service is active; wait for completion and retry'
+        fi
+        run rm -f "$SYSTEMD_DIR/greenbone-$job.timer" "$SYSTEMD_DIR/greenbone-$job.service"
+    done
+    run rm -f "$CRON_DIR/greenbone-maintenance"
 fi
-
-#---------------------------------------------------------------------- render
-render() {  # render <src> <dst> <mode>
-  local src="$1" dst="$2" mode="$3" tmp
-  tmp="$(mktemp)"
-  sed -e "s|@SBIN_DIR@|${SBIN_DIR}|g" \
-      -e "s|@CONFIG_DIR@|${CONFIG_DIR}|g" \
-      -e "s|@CONFIG_FILE@|${CONFIG_FILE}|g" \
-      -e "s|@DATA_DIR@|${DATA_DIR}|g" \
-      -e "s|@BACKUP_DIR@|${BACKUP_DIR}|g" \
-      -e "s|@LOG_FILE@|${LOG_FILE}|g" \
-      -e "s|@LOCK_FILE@|${LOCK_FILE}|g" \
-      -e "s|@RUN_USER@|${RUN_USER}|g" \
-      -e "s|@RUN_GROUP@|${RUN_GROUP}|g" \
-      -e "s|@PROJECT@|${PROJECT}|g" \
-      -e "s|@NGINX_HOST@|${NGINX_HOST}|g" \
-      -e "s|@NGINX_HTTP_PORT@|${NGINX_HTTP_PORT}|g" \
-      -e "s|@CRON_SCHEDULE@|${CRON_SCHEDULE}|g" \
-      -e "s|@CRON_MAILTO@|${CRON_MAILTO}|g" \
-      -e "s|@SYSTEMD_ONCALENDAR@|${SYSTEMD_ONCALENDAR}|g" \
-      -e "s|@GITHUB_SLUG@|${GITHUB_SLUG}|g" \
-      "$src" > "$tmp"
-  if [ "$DRY_RUN" -eq 1 ]; then
-    printf '    [dry] render %s -> %s (mode %s)\n' "$(basename "$src")" "$dst" "$mode"
-    rm -f "$tmp"; return 0
-  fi
-  install -D -m "$mode" "$tmp" "$dst"
-  [ "$IS_ROOT" -eq 1 ] && chown "$RUN_USER:$RUN_GROUP" "$dst" 2>/dev/null || true
-  rm -f "$tmp"
-}
-
-#----------------------------------------------------------------------- steps
-create_dirs() {
-  info "[1/6] Creating directories"
-  run install -d -m 750 "$CONFIG_DIR" "$DATA_DIR" "$BACKUP_DIR" "$LOG_DIR"
-  run install -d -m 755 "$SBIN_DIR"
-  [ -d "$LOCK_DIR" ] || run install -d -m 755 "$LOCK_DIR"
-  if [ "$IS_ROOT" -eq 1 ]; then
-    run chown -R "$RUN_USER:$RUN_GROUP" "$DATA_DIR" "$CONFIG_DIR"
-  fi
-}
-
-install_script() {
-  info "[2/6] Installing script -> $SBIN_DIR/greenbone-update.sh"
-  bash -n "$SRC_DIR/bin/greenbone-update.sh" || die "script syntax error"
-  render "$SRC_DIR/bin/greenbone-update.sh" "$SBIN_DIR/greenbone-update.sh" 0750
-}
-
-install_config() {
-  info "[3/6] Installing config -> $CONFIG_FILE"
-  if [ -f "$CONFIG_FILE" ] && [ "$FORCE" -eq 0 ]; then
-    warn "config already exists, keeping it (use --force to overwrite)"
-    return 0
-  fi
-  [ -f "$CONFIG_FILE" ] && run cp -a "$CONFIG_FILE" "${CONFIG_FILE}.bak.$(date +%Y%m%d-%H%M%S)"
-  render "$SRC_DIR/config/update.env.example" "$CONFIG_FILE" 0600
-}
-
-install_logrotate() {
-  info "[4/6] logrotate"
-  if [ "$IS_ROOT" -eq 1 ] && [ -d /etc/logrotate.d ]; then
-    render "$SRC_DIR/logrotate/greenbone-update.in" /etc/logrotate.d/greenbone-update 0644
-    [ "$DRY_RUN" -eq 1 ] || chown root:root /etc/logrotate.d/greenbone-update
-  else
-    warn "no logrotate.d / not root - the script will use its own internal rotation"
-  fi
-}
-
-install_systemd() {
-  info "[5/6] Installing systemd timer (OnCalendar: $SYSTEMD_ONCALENDAR)"
-  render "$SRC_DIR/systemd/greenbone-update.service.in" /etc/systemd/system/greenbone-update.service 0644
-  render "$SRC_DIR/systemd/greenbone-update.timer.in"   /etc/systemd/system/greenbone-update.timer   0644
-  [ "$DRY_RUN" -eq 1 ] || chown root:root /etc/systemd/system/greenbone-update.{service,timer}
-  run systemctl daemon-reload
-  run systemctl enable --now greenbone-update.timer
-}
-
-install_cron() {
-  info "[5/6] Installing cron ($CRON_SCHEDULE)"
-  if [ "$IS_ROOT" -eq 1 ] && [ -d /etc/cron.d ]; then
-    render "$SRC_DIR/cron/greenbone-update.cron.in" /etc/cron.d/greenbone-update 0644
-    [ "$DRY_RUN" -eq 1 ] || chown root:root /etc/cron.d/greenbone-update
-    info "    /etc/cron.d/greenbone-update"
-  else
-    command -v crontab >/dev/null 2>&1 || die "crontab not found, use --scheduler none"
-    local marker="# greenbone-update (managed by install.sh)"
-    local line="$CRON_SCHEDULE GB_CONFIG_FILE=$CONFIG_FILE $SBIN_DIR/greenbone-update.sh >/dev/null 2>&1"
-    if [ "$DRY_RUN" -eq 1 ]; then
-      printf '    [dry] crontab entry: %s\n' "$line"; return 0
-    fi
-    { crontab -l 2>/dev/null | grep -vF "$marker" | grep -vF "greenbone-update.sh" || true
-      printf '%s\n%s\n' "$marker" "$line"
-    } | crontab -
-    info "    added to the user crontab ($RUN_USER)"
-  fi
-}
-
-verify() {
-  info "[6/6] Verification"
-  if [ "$DRY_RUN" -eq 1 ]; then printf '    [dry] skipped\n'; return 0; fi
-  [ -x "$SBIN_DIR/greenbone-update.sh" ] || die "script could not be installed"
-  [ -r "$CONFIG_FILE" ] || die "config could not be installed"
-  if grep -qE '@[A-Z_]+@' "$SBIN_DIR/greenbone-update.sh"; then
-    warn "unprocessed placeholders left in the script: $(grep -oE '@[A-Z_]+@' "$SBIN_DIR/greenbone-update.sh" | sort -u | tr '\n' ' ')"
-  fi
-  case "$SCHEDULER" in
-    systemd) systemctl is-enabled greenbone-update.timer >/dev/null 2>&1 \
-               && info "    timer active: $(systemctl show -p NextElapseUSecRealtime --value greenbone-update.timer 2>/dev/null || echo '-')" \
-               || warn "timer could not be enabled" ;;
-    cron)    info "    cron entry written" ;;
-    none)    warn "no scheduler installed (--scheduler none)" ;;
-  esac
-}
-
-#------------------------------------------------------------------------ main
-cat <<EOF
-greenbone-update installer
-  mode       : $([ "$IS_ROOT" -eq 1 ] && echo "root (system-wide)" || echo "user ($RUN_USER)")
-  script     : $SBIN_DIR/greenbone-update.sh
-  config     : $CONFIG_FILE
-  data       : $DATA_DIR
-  log        : $LOG_FILE
-  lock       : $LOCK_FILE
-  host:port  : $NGINX_HOST:$NGINX_HTTP_PORT
-  scheduler  : $SCHEDULER ($([ "$SCHEDULER" = systemd ] && echo "$SYSTEMD_ONCALENDAR" || echo "$CRON_SCHEDULE"))
-  dry-run    : $DRY_RUN
-EOF
-
-check_deps
-create_dirs
-install_script
-install_config
-install_logrotate
+# shellcheck source=lib/tooling-lock.sh
+source "$SRC_DIR/lib/tooling-lock.sh"
+acquire_tooling_locks "$CONFIG_FILE" "$LOCK_FILE"
+if [[ "$DRY_RUN" == 1 ]]; then
+    printf '[dry-run] tooling, private config, logrotate and %s scheduler; no deployment\n' "$SCHEDULER"
+else
+    install -d -m 0755 "$SBIN_DIR"
+    for dir in "$CONFIG_DIR" "$DATA_DIR" "$BACKUP_DIR" "$LIB_DIR"; do
+        [[ -d "$dir" ]] || install -d -m 0700 "$dir"
+    done
+    mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$LOCK_FILE")"
+    if [[ "$IS_ROOT" == 1 ]]; then chown "$RUN_USER:$RUN_GROUP" "$CONFIG_DIR" "$DATA_DIR" "$BACKUP_DIR" "$LIB_DIR"; fi
+fi
+render "$SRC_DIR/bin/greenbone-update.sh" "$SBIN_DIR/greenbone-update.sh" 0755
+for file in maintenance.py gmp_probe.py; do run install -m 0644 "$SRC_DIR/lib/$file" "$LIB_DIR/$file"; done
+if [[ ! -f "$CONFIG_FILE" || "$FORCE" == 1 ]]; then
+    [[ ! -f "$CONFIG_FILE" ]] || run cp -p "$CONFIG_FILE" "$CONFIG_FILE.bak.$(date +%Y%m%d-%H%M%S)"
+    render "$SRC_DIR/config/update.env.example" "$CONFIG_FILE" 0600
+    if [[ "$IS_ROOT" == 1 ]]; then run chown "$RUN_USER:$RUN_GROUP" "$CONFIG_FILE"; fi
+else printf 'Existing configuration preserved; review new settings in config/update.env.example\n'; fi
+if [[ "$IS_ROOT" == 1 && -d "$LOGROTATE_DIR" ]]; then
+    render "$SRC_DIR/logrotate/greenbone-update.in" "$LOGROTATE_DIR/greenbone-update" 0644
+fi
 case "$SCHEDULER" in
-  systemd) install_systemd ;;
-  cron)    install_cron ;;
-  none)    info "[5/6] scheduler skipped" ;;
+    systemd)
+        for job in feed backup version-check; do
+            case "$job" in
+                feed) JOB_COMMAND=feed-update; JOB_CALENDAR="$SYSTEMD_ONCALENDAR" ;;
+                backup) JOB_COMMAND=backup; JOB_CALENDAR='*-*-* 02:00:00' ;;
+                version-check) JOB_COMMAND=version-check; JOB_CALENDAR='Sun *-*-* 05:00:00' ;;
+            esac
+            export JOB_COMMAND JOB_CALENDAR
+            render "$SRC_DIR/systemd/greenbone-update.service.in" "$SYSTEMD_DIR/greenbone-$job.service" 0644
+            render "$SRC_DIR/systemd/greenbone-update.timer.in" "$SYSTEMD_DIR/greenbone-$job.timer" 0644
+        done
+        run systemctl daemon-reload
+        for job in feed backup version-check; do run systemctl enable --now "greenbone-$job.timer"; done
+        ;;
+    cron)
+        CRON_USER="$RUN_USER"; [[ "$IS_ROOT" == 1 ]] || CRON_USER=''
+        export CRON_USER
+        if [[ "$IS_ROOT" == 1 ]]; then
+            render "$SRC_DIR/cron/greenbone-update.cron.in" "$CRON_DIR/greenbone-maintenance" 0644
+        elif [[ "$DRY_RUN" == 1 ]]; then printf '[dry-run] install user crontab maintenance entries\n'
+        else
+            temp=$(mktemp)
+            trap 'rm -f "$temp"' EXIT
+            render "$SRC_DIR/cron/greenbone-update.cron.in" "$temp" 0600
+            { printf '%s\n' "$filtered"; cat "$temp"; } | crontab -
+        fi
+        ;;
 esac
-verify
-
-cat <<EOF
-
-Installation complete.
-
-Next steps:
-  1) Review the config      : $CONFIG_FILE
-  2) Trial run              : ${IS_ROOT:+sudo }GB_DRY_RUN=1 $SBIN_DIR/greenbone-update.sh
-  3) Real run               : ${IS_ROOT:+sudo }$SBIN_DIR/greenbone-update.sh
-  4) Log                    : tail -f $LOG_FILE
-EOF
+printf 'Tooling ready. Review %s, then follow README for prepare/bootstrap. No stack deployed.\n' "$CONFIG_FILE"

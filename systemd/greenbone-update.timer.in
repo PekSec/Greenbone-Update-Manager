@@ -1,13 +1,12 @@
 [Unit]
-Description=Weekly Greenbone Community Edition update
-Documentation=https://github.com/@GITHUB_SLUG@
+Description=Greenbone maintenance schedule: @JOB_COMMAND@
 
 [Timer]
-OnCalendar=@SYSTEMD_ONCALENDAR@
-RandomizedDelaySec=1800
-Persistent=true
+OnCalendar=@JOB_CALENDAR@ UTC
+RandomizedDelaySec=0
+Persistent=false
 AccuracySec=1min
-Unit=greenbone-update.service
+# Unit is inferred from the installed timer basename.
 
 [Install]
 WantedBy=timers.target

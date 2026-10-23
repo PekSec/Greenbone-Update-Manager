@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Opt-in real Docker cold PostgreSQL backup/restore; never deploys Greenbone.
+
+Uses cached postgres:17-alpine as a stand-in for the image archive/tar helper.
+Only the PostgreSQL service starts. GMP and Greenbone compatibility are stubbed;
+all archive, checksum, image load, volume restoration and SQL checks are real.
+"""
+import copy
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import time
+import uuid
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
+import maintenance as m
+
+
+def main():
+    os.umask(0o077)
+    project = 'gb-test-' + uuid.uuid4().hex[:10]
+    with tempfile.TemporaryDirectory(prefix='gb-integration-') as directory:
+        root = Path(directory)
+        config = root / 'update.env'
+        config.write_text(f'DOWNLOAD_DIR="{root}/state"\nPROJECT="{project}"\nMIN_FREE_MB="1"\n')
+        config.chmod(0o600)
+        manager = m.Manager(m.read_config(config))
+        manager.state.mkdir()
+        credentials = Path(manager.cfg['GMP_CREDENTIALS_FILE'])
+        credentials.write_text('{"username":"integration","password":"unused"}')
+        credentials.chmod(0o600)
+        image = manager.docker('image', 'inspect', '--format', '{{.Id}}', 'postgres:17-alpine').strip()
+        c = {'services': {}, 'volumes': {v: {'name': project + '_' + v} for v in m.VOLUMES}}
+        for service in m.SERVICES:
+            c['services'][service] = {'image': image, 'volumes': [], 'environment': {}}
+        for service in ('vulnerability-tests', 'data-objects', 'report-formats'):
+            c['services'][service]['environment']['FEED_RELEASE'] = '24.10'
+        c['services']['pg-gvm'].update(network_mode='none', environment={'POSTGRES_HOST_AUTH_METHOD': 'trust'},
+            volumes=[{'type': 'volume', 'source': 'psql_data_vol', 'target': '/var/lib/postgresql/data'}])
+        c['services']['gvmd']['volumes'] = [{'type': 'volume', 'source': 'gvmd_data_vol', 'target': '/data'}]
+        bundle = m.seal({'schema': 1, 'id': 'integration', 'compose': c, 'restored_from': 'test-stand-in',
+            'references': {s: m.REGISTRY + m.IMAGE_REPOS.get(s, s) + ':stable' for s in m.SERVICES},
+            'feed_release': '24.10', 'gvmd_major': 26, 'evidence': 'isolated plumbing test only'})
+        m.validate_bundle(bundle)
+        m.atomic(manager.current, m.canonical(bundle))
+
+        def sql(compose, query):
+            return manager.dc(compose, 'exec', '-T', '-u', 'postgres', 'pg-gvm', 'psql', '-XAt',
+                              '-v', 'ON_ERROR_STOP=1', '-c', query, timeout=30).strip()
+
+        def start_postgres(compose):
+            manager.dc(compose, 'up', '-d', '--no-deps', '--pull', 'never', 'pg-gvm')
+            deadline = time.monotonic() + 90
+            while time.monotonic() < deadline:
+                try:
+                    manager.dc(compose, 'exec', '-T', 'pg-gvm', 'sh', '-c',
+                               'test "$(cat /proc/1/comm)" = postgres', timeout=10)
+                    if sql(compose, 'SELECT 1') == '1':
+                        return
+                except m.Failure:
+                    time.sleep(1)
+            raise AssertionError('PostgreSQL did not become ready')
+
+        try:
+            with manager.lock():
+                for volume in c['volumes'].values():
+                    manager.docker('volume', 'create', volume['name'])
+                start_postgres(c)
+                sql(c, "CREATE TABLE maintenance_test(value text); INSERT INTO maintenance_test VALUES ('before-migration')")
+                manager.docker('run', '--rm', '--pull=never', '--network', 'none', '--entrypoint', 'sh',
+                    '--mount', 'type=volume,src=' + c['volumes']['gvmd_data_vol']['name'] + ',dst=/data',
+                    image, '-c', 'printf essential-settings > /data/settings; chmod 600 /data/settings')
+                manager.dc(c, 'stop', '--timeout', '30')
+                ids = manager.dc(c, 'ps', '-aq').split()
+                states = json.loads(manager.docker('inspect', *ids))
+                assert all(x['State']['Status'] == 'exited' and x['State']['ExitCode'] == 0 for x in states)
+                snapshot = manager.snapshot(bundle)
+                manager.verify_backup(snapshot)
+                assert all(p.stat().st_mode & 0o077 == 0 for p in snapshot.rglob('*'))
+                # Simulate changed database content after an attempted upgrade.
+                start_postgres(c)
+                sql(c, "UPDATE maintenance_test SET value='after-migration'")
+                manager.dc(c, 'stop', '--timeout', '30')
+                manager.write_pending('upgrade', 'failed-release', snapshot)
+                with patch.object(manager, 'check_compatibility'), patch.object(manager, 'start', side_effect=start_postgres):
+                    manager.restore(snapshot, project, True)
+                restored = manager.load()
+                assert sql(restored['compose'], 'SELECT value FROM maintenance_test') == 'before-migration'
+                new_volume = restored['compose']['volumes']['gvmd_data_vol']['name']
+                content = manager.docker('run', '--rm', '--pull=never', '--network', 'none', '--entrypoint', 'cat',
+                    '--mount', 'type=volume,src=' + new_volume + ',dst=/data,readonly', image, '/data/settings')
+                assert content == 'essential-settings'
+                assert restored['compose']['volumes']['psql_data_vol']['name'] != c['volumes']['psql_data_vol']['name']
+                assert all(m.DIGEST.fullmatch(s['image']) for s in restored['compose']['services'].values())
+                assert not manager.pending.exists()
+                print('PASS: real stopped PostgreSQL snapshot, image archive/load, checksums, settings, fresh-volume restore and SQL rollback')
+        finally:
+            # Remove only this test's project/container/volume/tag names.
+            ids = manager.docker('ps', '-aq', '--filter', 'label=com.docker.compose.project=' + project).split()
+            if ids:
+                manager.docker('rm', '-f', *ids)
+            volumes = manager.docker('volume', 'ls', '-q').split()
+            own = [v for v in volumes if v.startswith(project + '_')]
+            if own:
+                manager.docker('volume', 'rm', *own)
+            tags = manager.docker('image', 'ls', '--format', '{{.Repository}}:{{.Tag}}').split()
+            own = [t for t in tags if t.startswith('greenbone-maintenance/' + project + ':')]
+            if own:
+                manager.docker('image', 'rm', *own)
+
+
+if __name__ == '__main__':
+    main()
