@@ -79,6 +79,7 @@ class WorkflowTests(unittest.TestCase):
         with patch.object(self.manager, 'check_compatibility'), patch.object(self.manager, 'scan_gate'), \
              patch.object(self.manager, 'health_once'), patch.object(self.manager, 'pull'), \
              patch.object(self.manager, 'protect_images'), patch.object(self.manager, 'stop'), \
+             patch.object(self.manager, 'capacity'), \
              patch.object(self.manager, 'snapshot', return_value=self.root / 'backup'), \
              patch.object(self.manager, 'start', side_effect=m.Failure('migration failed')) as start, \
              patch.object(self.manager, 'restore') as restore:
@@ -126,6 +127,7 @@ class WorkflowTests(unittest.TestCase):
             return ''
         with patch.object(self.manager, 'docker', side_effect=docker), \
              patch.object(self.manager, 'image_fingerprint', return_value='f' * 64), \
+             patch.object(self.manager, 'capacity'), patch.object(self.manager, 'stop'), \
              patch.object(self.manager, 'check_compatibility'), patch.object(self.manager, 'dc'), \
              patch.object(self.manager, 'volume_import', side_effect=m.Failure('restore failure', 74)), \
              patch.object(self.manager, 'start') as start:

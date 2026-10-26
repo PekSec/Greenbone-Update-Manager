@@ -11,7 +11,7 @@ command prints usage and exits. It never downloads and deploys the latest stack.
 
 ## What is supported
 
-Linux, Bash, Python **3.10+** (standard library), `flock`, Docker Engine and
+Linux, Bash, Python **3.10+** (standard library), `flock`, `findmnt`, Docker Engine and
 Compose v2 supporting `config --format json` and `--pull never`. Version reports
 also use Docker Buildx (`imagetools inspect`). Install Docker from its official
 instructions before using this tool. Python-gvm runs inside the pinned official
@@ -25,9 +25,15 @@ Docker daemons are not supported: the probe uses a local read-only bind mount.
 
 Greenbone describes its [container guide](https://greenbone.github.io/docs/latest/22.4/container/index.html)
 as a learning/test setup. This repository adds maintenance controls; it does not
-certify production readiness. The monthly **2–3 thousand hosts** target must be
+certify production readiness. The monthly **4,000 hosts** target must be
 measured with representative scans. Official minimum hardware is not a sizing
 recommendation for that target.
+
+Start with the [50–100 host pilot and production procedure](docs/production-readiness.md).
+The initial 16 vCPU / 32 GB RAM / 80 GB system + expandable 500 GB SSD data disk
+is a planning budget, not measured capacity. DefectDojo runs on another VM; its
+approximately 500,000 accumulated findings (including Info) are not Greenbone
+report/result counts. See the separate [opt-in real Greenbone acceptance drill](docs/greenbone-acceptance.md).
 
 ## First installation from zero
 
@@ -178,7 +184,12 @@ Set `ACK=1` only after arranging that external admission block and detaching tas
 schedules. The time gate is checked at entry, not a wall-clock kill deadline; size
 the window for the entire operation and keep it closed on failure/overrun. A long
 backup can cause the later feed job to exit `75`; investigate and rerun during a
-window. Automated jobs do not stop active scans to make room for maintenance.
+window. Production needs measured spacing or a single monitored backup-then-feed
+sequence with the independent timers disabled; see the
+[admission and retry procedure](docs/production-readiness.md#monthly-scanning-and-daily-maintenance-without-schedule-bypass).
+`status` records last successful operation timestamps; monitor those and actual
+feed age, as well as nonzero/omitted jobs. Automated jobs do not stop active scans
+to make room for maintenance.
 
 After configuring and testing that contract:
 
@@ -268,8 +279,9 @@ the pre-upgrade database **and** persistent state **and** saved images together.
 ## Backups and actual recovery
 
 `backup` first verifies idle/healthy state, then stops every stack container. It
-rejects a forced-killed container and any other running container mounting a
-stack volume. No active PostgreSQL volume is copied. This cold approach provides
+uses `docker stop --timeout -1` with a configurable client wait, verifies clean
+PostgreSQL shutdown, and rejects a forced-killed container or any other running
+container mounting a stack volume. No active PostgreSQL volume is copied. This cold approach provides
 a consistent filesystem set across PostgreSQL, gvmd state and keys at the cost
 of downtime and disk space. Custom PostgreSQL tablespaces/external mounts are not
 supported by this adapter.
@@ -296,14 +308,26 @@ Use trusted access-controlled backups and encrypt the separate disk/share at
 rest through your existing platform. No encryption key is stored by this tool.
 
 Set `BACKUP_COPY_DIR` to an **existing separate mounted disk/share directory**.
-The copy is verified and renamed from `.partial` only when complete. The tool does
+Configure `BACKUP_COPY_MOUNT` and `BACKUP_COPY_SOURCE` to assert its actual mount
+identity; otherwise directory existence cannot prove a remote copy. Identity,
+free space and a write/fsync probe are checked before downtime. Copy pins the
+target directory and detects disconnection/replacement. The copy is verified
+and renamed from `.partial` only when complete. The tool does
 not mount storage, store SSH credentials or claim a second directory is off-site.
 On copy failure it reports failure, keeps the local completed/partial backup and
 recovery marker; use `resume` to reopen the known set after diagnosis. An empty
 copy setting explicitly means the backup is local-only.
 
-`KEEP_BACKUPS=7` keeps the latest seven complete local snapshots, plus the newest
-upgrade recovery anchor. Old snapshots are verified before deletion; partials
+Every backup repeats feeds, images and all non-socket volumes; byte costs and
+operation times are logged. Optional `BACKUP_COMPRESSION=gzip` streams volume
+archives, retaining legacy plain-tar restore support. `DATA_MOUNT` lets `doctor`
+assert Docker root and actual volume placement. Operation estimates group new
+backup/copy/restore requirements per filesystem while retaining `MIN_FREE_MB`;
+old backups are never pre-deleted to pass the space gate. See the
+[space formulas, retention and timeout settings](docs/production-readiness.md).
+
+`KEEP_BACKUPS=7` is not a 500 GB capacity guarantee. It keeps the latest seven
+complete local snapshots, plus the newest upgrade recovery anchor. Old snapshots are verified before deletion; partials
 and unknown files are not pruned. Separate-target retention is your responsibility.
 Image tags are retained and **no image or volume prune runs**. Image archives also
 survive host image pruning; external `docker system prune -a` can still remove
@@ -405,7 +429,9 @@ python3 -m unittest discover -s tests -v
 for script in install.sh uninstall.sh bin/greenbone-update.sh lib/tooling-lock.sh; do bash -n "$script" || exit; done
 shellcheck -x install.sh uninstall.sh bin/greenbone-update.sh lib/tooling-lock.sh
 # Opt-in; requires Docker and a cached postgres:17-alpine image:
-python3 tests/docker_integration.py
+python3 tests/docker_integration.py --data-mb 64
+# Optional larger synthetic dataset / compressed archives:
+python3 tests/docker_integration.py --data-mb 1024 --compression gzip
 ```
 
 The isolated Docker test uses random `gb-test-*` names, real stopped PostgreSQL,
@@ -414,6 +440,6 @@ volumes. It checks old database content and application settings survive. It
 starts no Greenbone service; GMP/Greenbone compatibility are explicit stand-ins.
 It deletes only its own test resources. This test is not a real Greenbone
 migration, scanner/feed import test, clean alternate-Docker-store certification
-or 2–3k-host capacity measurement. Run a full Greenbone pilot and disaster-recovery
+or 4,000-host capacity measurement. Run a full Greenbone pilot and disaster-recovery
 drill on the VM before enabling unattended jobs. See
 [maintenance decisions and sources](docs/maintenance-design.md).

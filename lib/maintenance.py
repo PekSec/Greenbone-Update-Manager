@@ -80,18 +80,27 @@ def read_config(path):
     defaults = {"BACKUP_DIR": base + "/backups", "LOCK_FILE": base + "/maintenance.lock",
                 "LOG": base + "/maintenance.log", "KEEP_BACKUPS": "7", "HEALTH_TIMEOUT": "3600",
                 "COMMAND_TIMEOUT": "1800", "MIN_FREE_MB": "15000", "MAX_LOG_BYTES": "20971520",
+                "STOP_TIMEOUT": "900", "BACKUP_TIMEOUT": "21600", "RESTORE_TIMEOUT": "21600",
+                "IMAGE_ARCHIVE_TIMEOUT": "7200", "SPACE_MARGIN_PERCENT": "20",
+                "BACKUP_COMPRESSION": "none", "DATA_MOUNT": "",
+                "BACKUP_COPY_MOUNT": "", "BACKUP_COPY_SOURCE": "",
                 "GMP_CREDENTIALS_FILE": str(Path(path).parent / "gmp-credentials.json"),
                 "BACKUP_COPY_DIR": "", "AUTO_WINDOW_UTC": "", "AUTO_WINDOW_ACK": "0",
                 "COMPOSE_URL": SOURCE_URL, "DOCKER_BIN": "docker"}
     for key, value in defaults.items():
         config.setdefault(key, value)
-    for key in ("KEEP_BACKUPS", "HEALTH_TIMEOUT", "COMMAND_TIMEOUT", "MIN_FREE_MB", "MAX_LOG_BYTES"):
+    for key in ("KEEP_BACKUPS", "HEALTH_TIMEOUT", "COMMAND_TIMEOUT", "MIN_FREE_MB", "MAX_LOG_BYTES",
+                "STOP_TIMEOUT", "BACKUP_TIMEOUT", "RESTORE_TIMEOUT", "IMAGE_ARCHIVE_TIMEOUT", "SPACE_MARGIN_PERCENT"):
         require(config[key].isdigit() and 0 < int(config[key]) <= 10**9, "Invalid positive integer: " + key, 64)
-    for key in ("DOWNLOAD_DIR", "BACKUP_DIR", "LOCK_FILE", "LOG", "GMP_CREDENTIALS_FILE", "BACKUP_COPY_DIR"):
+    for key in ("DOWNLOAD_DIR", "BACKUP_DIR", "LOCK_FILE", "LOG", "GMP_CREDENTIALS_FILE", "BACKUP_COPY_DIR",
+                "DATA_MOUNT", "BACKUP_COPY_MOUNT"):
         if config[key]:
             p = Path(config[key])
             require(p.is_absolute() and str(p) != "/" and not p.is_symlink(),
                     "Expected an absolute non-symlink path: " + key, 64)
+    require(config['BACKUP_COMPRESSION'] in ('none', 'gzip'), 'Invalid BACKUP_COMPRESSION', 64)
+    require(not config['BACKUP_COPY_SOURCE'] or config['BACKUP_COPY_MOUNT'], 'BACKUP_COPY_SOURCE requires BACKUP_COPY_MOUNT', 64)
+    require(not config['BACKUP_COPY_MOUNT'] or config['BACKUP_COPY_DIR'], 'BACKUP_COPY_MOUNT requires BACKUP_COPY_DIR', 64)
     if config["AUTO_WINDOW_UTC"]:
         require(re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]-(?:[01][0-9]|2[0-3]):[0-5][0-9]",
                              config["AUTO_WINDOW_UTC"]), "Invalid AUTO_WINDOW_UTC", 64)
@@ -105,10 +114,12 @@ def canonical(value):
     return (json.dumps(value, sort_keys=True, indent=2) + "\n").encode()
 
 
-def file_hash(path):
+def file_hash(path, check=None):
     h = hashlib.sha256()
     with Path(path).open("rb") as f:
         for block in iter(lambda: f.read(1024 * 1024), b""):
+            if check:
+                check()
             h.update(block)
     return h.hexdigest()
 
@@ -220,6 +231,22 @@ class Manager:
         self.pending = self.state / "incomplete-operation.json"
         self.stage = "init"
         self.dry_run = dry_run
+        self.deadlines = []
+
+    @contextmanager
+    def budget(self, setting):
+        started = time.monotonic()
+        self.deadlines.append(started + int(self.cfg[setting]))
+        try:
+            yield
+        finally:
+            self.deadlines.pop()
+            self.log(setting + ' elapsed_seconds=' + str(round(time.monotonic() - started, 1)))
+
+    def check_deadline(self):
+        remaining = min(self.deadlines) - time.monotonic() if self.deadlines else float('inf')
+        require(remaining > 0, 'Operation time budget exhausted during ' + self.stage)
+        return remaining
 
     def log(self, message):
         line = datetime.now(timezone.utc).isoformat(timespec="seconds") + " [" + self.stage + "] " + message
@@ -235,11 +262,12 @@ class Manager:
                 f.write(line + "\n")
 
     def run(self, command, input=None, stdout=None, timeout=None, allowed=(0,), stdin=None):
+        timeout = min(timeout or int(self.cfg['COMMAND_TIMEOUT']), self.check_deadline())
         try:
             result = subprocess.run(command, input=input, stdin=stdin, stdout=stdout or subprocess.PIPE,
                                     stderr=subprocess.PIPE, timeout=timeout or int(self.cfg["COMMAND_TIMEOUT"]), check=False)
         except subprocess.TimeoutExpired:
-            raise Failure("Command timed out during " + self.stage) from None
+            raise Failure("Command timed out during " + self.stage + "; Docker daemon work may continue; inspect before recovery") from None
         except OSError:
             raise Failure("Could not execute command during " + self.stage) from None
         # Raw command output/arguments may contain credentials; never log them.
@@ -254,8 +282,22 @@ class Manager:
         try:
             return self.run(command, **kwargs)
         except Failure:
-            if name:
-                self.run([self.cfg['DOCKER_BIN'], 'rm', '-f', name], allowed=(0, 1), timeout=30)
+            # Killing the CLI does not cancel daemon-side work. Only disposable
+            # archive helpers may be removed; never force-remove stack services.
+            deadlines, self.deadlines = self.deadlines, []
+            try:
+                if name:
+                    observation = self.run([self.cfg['DOCKER_BIN'], 'inspect', '--format', '{{.State.Status}}', name],
+                                           allowed=(0, 1), timeout=30)
+                    self.log('Archive helper after failure: ' + observation.strip())
+                    self.run([self.cfg['DOCKER_BIN'], 'rm', '-f', name], allowed=(0, 1), timeout=30)
+                    remaining = self.run([self.cfg['DOCKER_BIN'], 'ps', '-q', '--filter', 'name=^/' + name + '$'], timeout=30)
+                    require(not remaining.strip(), 'Archive helper still running; manual recovery required', 70)
+                elif args[:2] in (('image', 'save'), ('image', 'load')):
+                    self.run([self.cfg['DOCKER_BIN'], 'info'], timeout=30)
+                    self.log('Image operation failed; daemon is reachable but completion is unknown. Inspect Docker events, image inventory and disk activity before resume')
+            finally:
+                self.deadlines = deadlines
             raise
 
     def dc(self, c, *args, **kwargs):
@@ -306,6 +348,182 @@ class Manager:
             while not path.exists():
                 path = path.parent
             require(shutil.disk_usage(path).free // (1024 * 1024) >= int(self.cfg["MIN_FREE_MB"]), "Insufficient free disk space (MIN_FREE_MB)")
+
+    def mount_info(self, path):
+        if os.access(path, os.F_OK):
+            reply = json.loads(self.run(['findmnt', '--json', '--target', str(path), '--output', 'TARGET,SOURCE,FSTYPE,MAJ:MIN']))
+            return reply['filesystems'][0]
+        # Reading the mount table also works for Docker directories whose
+        # parents are searchable only by root. Longest prefix wins.
+        reply = json.loads(self.run(['findmnt', '--json', '--list', '--output', 'TARGET,SOURCE,FSTYPE,MAJ:MIN']))
+        path = Path(path).absolute()
+        matches = [item for item in reply['filesystems'] if path.is_relative_to(item['target'])]
+        require(matches, 'Cannot identify filesystem mount', 69)
+        return max(reversed(matches), key=lambda item: len(item['target']))
+
+    @staticmethod
+    def accessible_path(path):
+        path = Path(path)
+        while True:
+            try:
+                path.stat()
+                return path
+            except (PermissionError, FileNotFoundError):
+                require(path != path.parent, 'No accessible filesystem ancestor', 69)
+                path = path.parent
+
+    def remote_target(self):
+        destination = self.cfg['BACKUP_COPY_DIR']
+        if not destination:
+            return None
+        path = Path(destination).resolve(strict=True)
+        parent = Path(self.cfg['BACKUP_DIR']).resolve()
+        require(path.is_dir() and path != parent and parent not in path.parents,
+                'BACKUP_COPY_DIR must be an existing separate destination', 74)
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            info = self.mount_info(path)
+            expected = self.cfg['BACKUP_COPY_MOUNT']
+            if expected:
+                require(info['target'] == str(Path(expected).resolve()), 'Backup mount is missing or replaced', 74)
+            source = self.cfg['BACKUP_COPY_SOURCE']
+            require(not source or info['source'] == source, 'Backup mount source differs from expected identity', 74)
+            self.target_guard(path, fd, info)
+            # Pin the write probe too: detach must never probe the local fallback.
+            with tempfile.TemporaryFile(dir=Path('/proc/self/fd') / str(fd)) as probe:
+                probe.write(b'backup-write-probe')
+                probe.flush()
+                os.fsync(probe.fileno())
+            self.target_guard(path, fd, info)
+        finally:
+            os.close(fd)
+        return path, info
+
+    def target_guard(self, path, fd, identity):
+        self.check_deadline()
+        observed, pinned = os.stat(path), os.fstat(fd)
+        require(self.mount_info(path) == identity and observed.st_dev == pinned.st_dev and observed.st_ino == pinned.st_ino,
+                'Backup target disconnected or replaced during probe/copy', 74)
+
+    def tree_bytes(self, path):
+        # Apparent size plus per-entry tar/block overhead; do not assume a gzip ratio.
+        def unreadable(error):
+            raise error
+        total = 1024 * 1024
+        for directory, dirs, files in os.walk(path, onerror=unreadable):
+            self.check_deadline()
+            for name in dirs + files:
+                size = (Path(directory) / name).lstat().st_size
+                total += ((size + 4095) // 4096) * 4096 + 1024
+        return total
+
+    def storage_inventory(self, c, images=True):
+        root = Path(self.docker('info', '--format', '{{.DockerRootDir}}').strip())
+        require(root.is_absolute() and root.is_dir(), 'DockerRootDir is inaccessible', 69)
+        names = {v['name']: key for key, v in c['volumes'].items()}
+        existing = set(self.docker('volume', 'ls', '-q').split())
+        volumes, sizes = {}, {}
+        for name, key in names.items():
+            if name not in existing:
+                continue
+            item = json.loads(self.docker('volume', 'inspect', name))[0]
+            require(item['Driver'] == 'local' and not item.get('Options'), 'Unsupported volume driver/options', 64)
+            mount = Path(item['Mountpoint'])
+            volumes[key] = mount
+            if images and key not in SOCKETS:
+                if os.access(mount, os.R_OK | os.X_OK):
+                    sizes[key] = self.tree_bytes(mount)
+                else:
+                    helper = c['services']['pg-gvm']['image']
+                    output = self.docker('run', '--rm', '--pull=never', '--network', 'none', '--user', '0',
+                        '--entrypoint', 'du', '--mount', 'type=volume,src=' + name + ',dst=/source,readonly',
+                        helper, '-abl', '/source').splitlines()
+                    require(output, 'Cannot measure volume: ' + key, 69)
+                    sizes[key] = int(output[-1].split()[0]) + len(output) * 5120 + 1024 * 1024
+        unique = {}
+        if images:
+            references = sorted({service['image'] for service in c['services'].values()})
+            inspected = json.loads(self.docker('image', 'inspect', *references))
+            unique = {image['Id']: int(image['Size']) + 1024 * 1024 for image in inspected}
+        return {'root': root, 'volumes': volumes, 'volume_bytes': sizes, 'image_bytes': sum(unique.values())}
+
+    def report_storage(self, c, images=True):
+        inventory = self.storage_inventory(c, images=images)
+        paths = {'DockerRootDir': inventory['root'], **inventory['volumes']}
+        expected = self.cfg['DATA_MOUNT']
+        if expected:
+            require(self.mount_info(expected)['target'] == str(Path(expected).resolve()), 'DATA_MOUNT is not mounted', 69)
+        for label, path in paths.items():
+            info = self.mount_info(path)
+            accessible = self.accessible_path(path)
+            require(self.mount_info(accessible) == info, 'Filesystem is inaccessible for disk-space inspection: ' + label, 69)
+            self.log('Storage ' + label + ' path=' + str(path) + ' mount=' + info['target'] +
+                     ' source=' + info['source'] + ' free_bytes=' + str(shutil.disk_usage(accessible).free))
+            if expected:
+                require(info['target'] == str(Path(expected).resolve()) and accessible.stat().st_dev == Path(expected).stat().st_dev,
+                        'Docker/volume is outside DATA_MOUNT: ' + label, 69)
+        self.log('Data disk verified against DATA_MOUNT' if expected else 'Data disk UNVERIFIED: configure DATA_MOUNT after checking mount/source identities')
+        return inventory
+
+    def report_scanner(self, c):
+        version = self.dc(c, 'exec', '-T', 'ospd-openvas', 'openvas', '--version').splitlines()
+        require(version, 'Scanner version is unavailable', 73)
+        self.log('Scanner binary: ' + version[0])
+        settings = self.dc(c, 'exec', '-T', 'ospd-openvas', 'openvas', '-s')
+        values = {}
+        for line in settings.splitlines():
+            match = re.fullmatch(r'\s*(max_hosts|max_checks)\s*=\s*(\d+)\s*', line)
+            if match:
+                values[match[1]] = int(match[2])
+        require(set(values) == {'max_hosts', 'max_checks'}, 'Scanner concurrency settings are unavailable', 73)
+        self.log('Scanner configuration defaults=' + json.dumps(values) + '; task/GMP preferences may override these. No task settings changed')
+
+    def space_check(self, needs):
+        grouped = {}
+        for label, path, size in needs:
+            path = self.accessible_path(path)
+            group = grouped.setdefault(path.stat().st_dev, {'path': path, 'bytes': 0, 'labels': []})
+            group['bytes'] += size
+            group['labels'].append(label + '=' + str(size))
+        for device, group in grouped.items():
+            usage = shutil.disk_usage(group['path'])
+            reserve = int(self.cfg['MIN_FREE_MB']) * 1024 * 1024
+            needed = (group['bytes'] * (100 + int(self.cfg['SPACE_MARGIN_PERCENT'])) + 99) // 100 + reserve
+            self.log('Space filesystem=' + str(device) + ' used_bytes=' + str(usage.used) +
+                     ' free_bytes=' + str(usage.free) + ' required_extra_with_reserve=' + str(needed) +
+                     ' components=' + ','.join(group['labels']))
+            require(usage.free >= needed, 'Insufficient operation space; existing backups/old volumes are retained', 69)
+
+    def capacity(self, c, operation, backup=None):
+        inventory = self.report_storage(c, images=operation != 'restore')
+        needs = [('temporary-state', self.state, 16 * 1024 * 1024)]
+        if operation == 'backup':
+            require(set(inventory['volume_bytes']) == set(VOLUMES) - SOCKETS, 'Missing persistent volumes before backup', 69)
+            volume_bytes = sum(inventory['volume_bytes'].values())
+            size = volume_bytes + inventory['image_bytes'] + 16 * 1024 * 1024
+            parent = Path(self.cfg['BACKUP_DIR'])
+            retained = self.tree_bytes(parent) if parent.exists() else 0
+            feed_bytes = sum(inventory['volume_bytes'].get(key, 0) for key in
+                             ('vt_data_vol', 'notus_data_vol', 'scap_data_vol', 'cert_data_vol', 'data_objects_vol'))
+            self.log('Full backup estimate volume_bytes=' + str(volume_bytes) + ' feed_subset_bytes=' + str(feed_bytes) +
+                     ' image_archive_bytes=' + str(inventory['image_bytes']) + ' retained_backup_bytes=' + str(retained))
+            needs.append(('new-full-backup-before-retention', parent, size))
+            remote = self.remote_target()
+            if remote:
+                needs.append(('separate-copy', remote[0], size))
+        elif operation == 'restore':
+            size = 0
+            for key in VOLUMES:
+                if key in SOCKETS:
+                    continue
+                with tarfile.open(self.volume_archive(backup, key), 'r|*') as archive:
+                    for member in archive:
+                        self.check_deadline()
+                        size += ((member.size + 4095) // 4096) * 4096 + 4096
+            needs += [('new-volume-generation-old-retained', inventory['root'], size),
+                      ('image-load-and-temporary-layers', inventory['root'], (Path(backup) / 'images.tar').stat().st_size * 3)]
+        self.space_check(needs)
+        return inventory
 
     def release_path(self, target):
         require(ID.fullmatch(target or ""), "An explicit valid --target release ID is required", 64)
@@ -436,6 +654,7 @@ class Manager:
         deadline = time.monotonic() + int(self.cfg["HEALTH_TIMEOUT"])
         last = "Services are not ready"
         while time.monotonic() < deadline:
+            self.check_deadline()
             try:
                 self.health_once(c)
                 self.log("Manager, scanner, feeds and container lifecycles are ready")
@@ -445,11 +664,40 @@ class Manager:
                 time.sleep(5)
         raise Failure("Health timeout: " + last, 73)
 
-    def stop(self, c):
+    def stop(self, c, allow_empty=False, recovery=False):
         self.stage = "stop"
-        self.dc(c, "stop", "--timeout", "120", timeout=300)
-        for name, state in self.states(c).items():
-            require(state.get("Status") == "exited" and state.get("ExitCode") != 137, "Container did not stop cleanly: " + str(name))
+        ids = self.docker('ps', '-aq', '--filter', 'label=com.docker.compose.project=' + self.cfg['PROJECT']).split()
+        require(ids or allow_empty, 'No deployed containers found', 73)
+        with self.budget('STOP_TIMEOUT'):
+            if ids:
+                before = {item['Id']: item['State']['Status'] for item in json.loads(self.docker('inspect', *ids))}
+                try:
+                    # The daemon may wait indefinitely; the client budget never
+                    # schedules SIGKILL for a database that is still shutting down.
+                    self.docker('stop', '--timeout', '-1', *ids, timeout=int(self.cfg['STOP_TIMEOUT']))
+                except Failure:
+                    # Inspect outside the expired budget; never treat a late stop as success.
+                    deadlines, self.deadlines = self.deadlines, []
+                    try:
+                        observed = json.loads(self.docker('inspect', *ids, timeout=30))
+                        self.log('Stop failed; observed states=' + ','.join(x['State']['Status'] for x in observed) +
+                                 '; daemon stop requests may still be running. Keep admission closed')
+                    finally:
+                        self.deadlines = deadlines
+                    raise
+                for container in json.loads(self.docker('inspect', *ids)):
+                    state = container['State']
+                    name = container.get('Config', {}).get('Labels', {}).get('com.docker.compose.service', 'unknown')
+                    if recovery and before[container['Id']] in ('exited', 'created'):
+                        require(state.get('Status') in ('exited', 'created'), 'Old recovery container became active: ' + name)
+                        continue
+                    require(state.get('Status') == 'exited' and state.get('ExitCode') != 137 and not state.get('OOMKilled'),
+                            'Container did not stop cleanly: ' + name)
+                    require(name != 'pg-gvm' or state.get('ExitCode') == 0, 'PostgreSQL did not shut down cleanly')
+                if not recovery:
+                    # Preserve the original running-image/mount drift gate for
+                    # normal maintenance; crashed restore targets may be mixed.
+                    self.states(c)
         for volume in c["volumes"].values():
             require(not self.docker("ps", "-q", "--filter", "volume=" + volume["name"]).strip(), "Another running container uses a stack volume")
 
@@ -471,18 +719,30 @@ class Manager:
     def volume_export(self, image, volume, path):
         with Path(path).open("wb") as archive:
             self.docker("run", "--rm", "--pull=never", "--network", "none", "--user", "0", "--entrypoint", "tar",
-                        "--mount", "type=volume,src=" + volume + ",dst=/source,readonly", image, "-C", "/source", "-cpf", "-", ".", stdout=archive)
+                        "--mount", "type=volume,src=" + volume + ",dst=/source,readonly", image, "-C", "/source",
+                        '-czpf' if str(path).endswith('.gz') else '-cpf', "-", ".", stdout=archive,
+                        timeout=int(self.cfg['BACKUP_TIMEOUT']))
 
     def volume_import(self, image, volume, path):
         with Path(path).open("rb") as archive:
             try:
                 self.docker('run', '--rm', '-i', '--pull=never', '--network', 'none', '--user', '0',
                             '--entrypoint', 'tar', '--mount', 'type=volume,src=' + volume + ',dst=/dest',
-                            image, '-C', '/dest', '-xpf', '-', stdin=archive)
+                            image, '-C', '/dest', '-xzpf' if str(path).endswith('.gz') else '-xpf', '-', stdin=archive,
+                            timeout=int(self.cfg['RESTORE_TIMEOUT']))
             except Failure:
                 raise Failure("Volume restoration failed or timed out", 74) from None
 
     def snapshot(self, bundle):
+        with self.budget('BACKUP_TIMEOUT'):
+            return self._snapshot(bundle)
+
+    @staticmethod
+    def volume_archive(path, key):
+        plain = Path(path) / 'volumes' / (key + '.tar')
+        return plain if plain.exists() else plain.with_suffix('.tar.gz')
+
+    def _snapshot(self, bundle):
         self.stage = "backup"
         parent = Path(self.cfg["BACKUP_DIR"])
         parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -496,29 +756,37 @@ class Manager:
         shutil.copyfile(self.cfg["GMP_CREDENTIALS_FILE"], partial / "credentials.json")
         tags = self.protect_images(bundle)
         image_fingerprints = {tag: self.image_fingerprint(tag) for tag in tags.values()}
-        self.docker("image", "save", "-o", str(partial / "images.tar"), *sorted(tags.values()))
+        with self.budget('IMAGE_ARCHIVE_TIMEOUT'):
+            self.docker("image", "save", "-o", str(partial / "images.tar"), *sorted(tags.values()),
+                        timeout=int(self.cfg['IMAGE_ARCHIVE_TIMEOUT']))
         image = bundle["compose"]["services"]["pg-gvm"]["image"]
         volumes = {}
         for key, volume in bundle["compose"]["volumes"].items():
             if key in SOCKETS:
                 continue
             self.docker("volume", "inspect", volume["name"])
-            self.volume_export(image, volume["name"], partial / "volumes" / (key + ".tar"))
+            extension = '.tar.gz' if self.cfg['BACKUP_COMPRESSION'] == 'gzip' else '.tar'
+            self.volume_export(image, volume["name"], partial / "volumes" / (key + extension))
             volumes[key] = volume["name"]
         atomic(partial / "backup.json", canonical({"schema": 1, "kind": "cold-all-volumes",
                "project": self.cfg["PROJECT"], "volumes": volumes, "release": bundle["id"],
                "image_tags": tags, "image_fingerprints": image_fingerprints,
+               "volume_compression": self.cfg['BACKUP_COMPRESSION'],
                "created": datetime.now(timezone.utc).isoformat()}))
         files = sorted(p for p in partial.rglob("*") if p.is_file())
         for path in files:
             path.chmod(0o600)
             with path.open('rb') as handle:
                 os.fsync(handle.fileno())
-        atomic(partial / "checksums.json", canonical({str(p.relative_to(partial)): file_hash(p) for p in files}))
+        atomic(partial / "checksums.json", canonical({str(p.relative_to(partial)): file_hash(p, self.check_deadline) for p in files}))
         self.verify_backup(partial)
+        self.check_deadline()
         final = parent / identity
         os.replace(partial, final)
         self.log("Verified cold backup: " + str(final))
+        self.log('Backup actual_bytes=' + str(sum(p.stat().st_size for p in final.rglob('*') if p.is_file())) +
+                 ' image_archive_bytes=' + str((final / 'images.tar').stat().st_size) +
+                 ' volume_archive_bytes=' + json.dumps({p.name: p.stat().st_size for p in (final / 'volumes').iterdir()}))
         self.copy_backup(final)
         return final
 
@@ -532,14 +800,19 @@ class Manager:
         path = Path(path)
         require(path.is_dir() and not path.is_symlink(), "Backup directory missing or unsafe", 74)
         checksums = json.loads((path / "checksums.json").read_bytes())
+        metadata = json.loads((path / 'backup.json').read_bytes())
+        compression = metadata.get('volume_compression', 'none')
+        require(compression in ('none', 'gzip'), 'Unknown backup compression', 74)
+        extension = '.tar.gz' if compression == 'gzip' else '.tar'
         expected = {"release.json", "config.env", "credentials.json", "backup.json", "images.tar"}
-        expected.update("volumes/" + v + ".tar" for v in VOLUMES if v not in SOCKETS)
+        expected.update("volumes/" + v + extension for v in VOLUMES if v not in SOCKETS)
         require(set(checksums) == expected, "Incomplete backup inventory", 74)
         actual = {str(p.relative_to(path)) for p in path.rglob("*") if p.is_file()}
         require(actual == expected | {"checksums.json"}, "Unexpected backup files", 74)
         for name, digest in checksums.items():
+            self.check_deadline()
             file = path / name
-            require(not file.is_symlink() and file_hash(file) == digest, "Backup checksum mismatch", 74)
+            require(not file.is_symlink() and file_hash(file, self.check_deadline) == digest, "Backup checksum mismatch", 74)
         bundle = self.load(path / "release.json")
         metadata = json.loads((path / "backup.json").read_bytes())
         require(metadata.get("schema") == 1 and metadata.get("kind") == "cold-all-volumes"
@@ -561,8 +834,9 @@ class Manager:
                 for name in [image['Config'], *image['Layers']]:
                     require(archive.getmember(name).isfile(), 'Incomplete Docker image archive', 74)
         for name in metadata["volumes"]:
-            with tarfile.open(path / "volumes" / (name + ".tar"), "r|") as archive:
+            with tarfile.open(path / "volumes" / (name + extension), "r|*") as archive:
                 for member in archive:
+                    self.check_deadline()
                     p = PurePosixPath(member.name)
                     require(not p.is_absolute() and ".." not in p.parts and not member.isdev(), "Unsafe volume archive entry", 74)
                     if member.issym() or member.islnk():
@@ -572,17 +846,44 @@ class Manager:
         return bundle
 
     def copy_backup(self, backup):
-        destination = self.cfg["BACKUP_COPY_DIR"]
-        if not destination:
+        target = self.remote_target()
+        if not target:
             self.log("No separate backup destination configured; local backup only")
             return
-        destination = Path(destination).resolve()
-        require(destination.is_dir() and destination != backup.parent.resolve() and backup.parent.resolve() not in destination.parents,
-                "BACKUP_COPY_DIR must be an existing separate destination", 74)
-        partial = destination / ("." + backup.name + ".partial")
-        shutil.copytree(backup, partial)
-        self.verify_backup(partial)
-        os.replace(partial, destination / backup.name)
+        destination, identity = target
+        size = sum(p.stat().st_size for p in backup.rglob('*') if p.is_file())
+        self.space_check([('backup-copy', destination, size)])
+        fd = os.open(destination, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            pinned = Path('/proc/self/fd') / str(fd)
+            def guard():
+                self.target_guard(destination, fd, identity)
+
+            def copy_file(source, dest):
+                guard()
+                with open(source, 'rb') as src, open(dest, 'xb') as dst:
+                    while True:
+                        self.check_deadline()
+                        data = src.read(1024 * 1024)
+                        if not data:
+                            break
+                        dst.write(data)
+                    dst.flush()
+                    os.fsync(dst.fileno())
+                shutil.copystat(source, dest)
+                guard()
+                return dest
+
+            guard()
+            partial = pinned / ('.' + backup.name + '.partial')
+            shutil.copytree(backup, partial, copy_function=copy_file)
+            self.verify_backup(partial)
+            guard()
+            os.replace(partial, pinned / backup.name)
+            os.fsync(fd)
+            guard()
+        finally:
+            os.close(fd)
         self.log("Verified backup copy at separate destination")
 
     def retention(self, protect):
@@ -597,16 +898,23 @@ class Manager:
                 self.verify_backup(path)
                 shutil.rmtree(path)
 
-    def finish(self, bundle):
+    def finish(self, bundle, operation=None):
+        self.check_deadline()
+        operation = operation or json.loads(self.pending.read_bytes())['operation']
         atomic(self.current, canonical(seal(bundle)))
+        path = self.state / 'last-success.json'
+        successes = json.loads(path.read_bytes()) if path.exists() else {}
+        successes[operation] = {'time': datetime.now(timezone.utc).isoformat(), 'release': bundle['id']}
+        atomic(path, canonical(successes))
         self.pending.unlink()
-        self.log("Operation completed and verified")
+        self.log(operation + " completed and verified")
 
     def backup(self, explicit):
         bundle = self.load()
         self.window(explicit)
         self.scan_gate(bundle["compose"])
         self.health_once(bundle["compose"])
+        self.capacity(bundle['compose'], 'backup')
         self.scan_gate(bundle["compose"])
         self.write_pending("backup", bundle["id"])
         self.stop(bundle["compose"])
@@ -660,6 +968,7 @@ class Manager:
         self.pull(candidate["compose"])
         self.protect_images(candidate)
         if old:
+            self.capacity(old['compose'], 'backup')
             self.scan_gate(old["compose"])
         self.write_pending("bootstrap" if bootstrap else "upgrade", target)
         if old:
@@ -672,13 +981,24 @@ class Manager:
         self.finish(candidate)
 
     def restore(self, path, confirmation, explicit):
+        with self.budget('RESTORE_TIMEOUT'):
+            return self._restore(path, confirmation, explicit)
+
+    def _restore(self, path, confirmation, explicit):
         require(confirmation == self.cfg["PROJECT"], "Restore requires --confirm-project with the exact PROJECT", 64)
         self.window(explicit)
         self.stage = "restore-verify"
         path = Path(path).resolve(strict=True)
         saved = self.verify_backup(path)
         saved.setdefault('repository_digests', {s: v['image'] for s, v in saved['compose']['services'].items()})
-        self.docker("image", "load", "-i", str(path / "images.tar"))
+        live = self.load() if self.current.exists() else saved
+        running = self.docker("ps", "-q", "--filter", "label=com.docker.compose.project=" + self.cfg["PROJECT"]).strip()
+        if running:
+            self.scan_gate(live["compose"])
+        self.capacity(live['compose'], 'restore', path)
+        self.write_pending('restore', saved['id'], path)
+        with self.budget('IMAGE_ARCHIVE_TIMEOUT'):
+            self.docker("image", "load", "-i", str(path / "images.tar"), timeout=int(self.cfg['IMAGE_ARCHIVE_TIMEOUT']))
         metadata = json.loads((path / "backup.json").read_bytes())
         for image, tag in metadata["image_tags"].items():
             require(self.image_fingerprint(tag) == metadata["image_fingerprints"][tag], "Loaded image differs from backup", 74)
@@ -690,14 +1010,14 @@ class Manager:
         saved["restored_from"] = str(path)
         saved = seal(saved)
         self.check_compatibility(saved)
-        live = self.load() if self.current.exists() else saved
-        running = self.docker("ps", "-q", "--filter", "label=com.docker.compose.project=" + self.cfg["PROJECT"]).strip()
         if running:
             self.scan_gate(live["compose"])
-        self.write_pending("restore", saved["id"], path)
         self.stage = "restore"
-        # down never removes volumes; old data survives even a failed restore.
-        self.dc(live["compose"], "down", "--timeout", "120", timeout=300)
+        self.stop(live['compose'], allow_empty=True, recovery=True)
+        # Compose rm --force suppresses its prompt; without --stop it only
+        # removes stopped containers. Never use down's force-kill deadline.
+        self.dc(live['compose'], 'rm', '--force')
+        self.stage = 'restore'
         restored = copy.deepcopy(saved)
         suffix = uuid.uuid4().hex[:12]
         helper = saved["compose"]["services"]["pg-gvm"]["image"]
@@ -706,7 +1026,7 @@ class Manager:
             self.docker("volume", "create", volume)
             restored["compose"]["volumes"][key] = {"name": volume}
             if key not in SOCKETS:
-                self.volume_import(helper, volume, path / "volumes" / (key + ".tar"))
+                self.volume_import(helper, volume, self.volume_archive(path, key))
         # The saved database and saved probe identity must agree.
         atomic(Path(self.cfg["GMP_CREDENTIALS_FILE"]), (path / "credentials.json").read_bytes())
         restored = seal(restored)
@@ -730,7 +1050,7 @@ class Manager:
             self.scan_gate(bundle['compose'])
         self.log('Operator requested resume of the recorded image/data set; no data restoration')
         self.start(bundle['compose'])
-        self.finish(bundle)
+        self.finish(bundle, operation='resume')
 
     def image_fingerprint(self, image):
         info = json.loads(self.docker("image", "inspect", image))[0]
@@ -791,6 +1111,8 @@ class Manager:
                 return
             if args.command == "status":
                 self.log("Current release: " + self.load()["id"] if self.current.exists() else "No current managed release")
+                success = self.state / 'last-success.json'
+                self.log('Last successful operations: ' + (success.read_text().strip() if success.exists() else 'not recorded yet'))
                 if self.pending.exists():
                     pending = json.loads(self.pending.read_bytes())
                     self.log("INCOMPLETE " + pending.get("operation", "unknown") + "; backup=" + pending.get("backup", ""))
@@ -804,6 +1126,9 @@ class Manager:
                 source_hash = hashlib.sha256(Path(args.compose).read_bytes()).hexdigest()
                 atomic(self.release_path(args.target).parent / "source.sha256", (source_hash + "\n").encode())
             elif args.command == "doctor":
+                self.report_storage(self.load()['compose'])
+                self.remote_target()
+                self.report_scanner(self.load()['compose'])
                 self.health_once(self.load()["compose"])
                 self.log("Doctor passed; capacity and a full scan still require a pilot")
                 self.require_clean()
